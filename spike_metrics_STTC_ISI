@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+spike_metrics.py
+================
+Post-hoc event-timing metrics from the per_peak.csv files: inter-event interval
+statistics per cell, and rate-independent synchrony per well.
+
+WHY STTC AND NOT CORRELATION
+----------------------------
+NBI cuts the event rate by 70-99%. Every naive coupling measure - zero-lag
+cross-correlation, binned Pearson, coincidence count - falls with rate on its
+own, so a rate drop would masquerade as desynchronisation whether or not
+coordination actually changed. The spike time tiling coefficient (Cutts and
+Eglen, 2014) was designed for exactly this problem and is rate-independent by
+construction.
+
+Every synchrony number is also reported against a CIRCULAR-SHIFT NULL: each
+cell's event times are rotated by a random offset modulo the recording length,
+which destroys cross-cell timing while preserving each cell's own rate and
+burst structure. `sttc_above_chance` is the number that means something.
+
+WHAT IT MEASURES
+----------------
+per cell   n_events, median_isi, cv_isi, cv2_isi, burst metrics
+per well   mean pairwise STTC, the null, STTC above chance, and coactivity:
+           the largest fraction of a well's active cells whose events fall in
+           one time bin, plus the fraction of all events inside that bin
+
+cv_isi is the regularity index: near 0 for a metronomic pacemaker, near 1 for a
+Poisson process, above 1 for bursting. cv2_isi is the local version, insensitive
+to slow drift in rate across the recording.
+
+Requires numpy, pandas, scipy. Run:  python spike_metrics.py
+"""
+
+from __future__ import annotations
+
+import os
+import glob
+import sys
+import itertools
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# ============================== USER CONFIG ==============================
+
+# per_peak.csv files, or a glob. One row per detected event.
+PEAK_FILES = [
+    r"/Users/parnazs/Documents/Documents/PARNAZ/UNIVERSITY/DPHIL/Phenix Harmony 3 files/FLUO4_BATCH_OUT/Trunc333/*trunc333_per_peak.csv",
+]
+# per_object.csv for the same sheets - needed to know how many cells were
+# WATCHED, not just how many fired. Without it, coactivity denominators are wrong.
+OBJECT_FILES = [
+    r"/Users/parnazs/Documents/Documents/PARNAZ/UNIVERSITY/DPHIL/Phenix Harmony 3 files/FLUO4_BATCH_OUT/Trunc333/*trunc333_per_object.csv",
+]
+OUT_DIR = r"/Users/parnazs/Documents/Documents/PARNAZ/UNIVERSITY/DPHIL/Phenix Harmony 3 files/FLUO4_BATCH_OUT/Trunc333/SPIKE_METRICS"
+
+FPS = 11
+STTC_DT = 1.0                # +/- window in seconds for the tiling coefficient
+STTC_DT_SENSITIVITY = [0.5, 1.0, 2.0]
+N_SHUFFLE = 200              # circular-shift repeats per well
+MAX_PAIRS = 4000             # cap on pairs per well; sampled if exceeded
+MIN_EVENTS_PER_CELL = 2      # a cell needs 2 events for an ISI
+MIN_CELLS_FOR_SYNC = 5       # wells below this give no usable synchrony estimate
+
+COACT_BIN_S = 2.0            # bin width for the coactivity measure
+BURST_ISI_S = 5.0            # events closer than this are in the same burst
+SEED = 0
+
+# ============================== MACHINERY ================================
+
+
+def sttc(a, b, dt, T):
+    """Spike time tiling coefficient (Cutts & Eglen 2014). a, b: sorted times."""
+    if len(a) == 0 or len(b) == 0:
+        return np.nan
+
+    def tiled(x):
+        """Fraction of [0,T] within +/-dt of any spike in x."""
+        lo = np.clip(x - dt, 0, T)
+        hi = np.clip(x + dt, 0, T)
+        o = np.argsort(lo)
+        lo, hi = lo[o], hi[o]
+        tot = 0.0
+        cs, ce = lo[0], hi[0]
+        for s, e in zip(lo[1:], hi[1:]):
+            if s <= ce:
+                ce = max(ce, e)
+            else:
+                tot += ce - cs
+                cs, ce = s, e
+        tot += ce - cs
+        return min(tot / T, 1.0)
+
+    def prop(x, y):
+        """Fraction of spikes in x lying within +/-dt of a spike in y."""
+        idx = np.searchsorted(y, x)
+        near = np.zeros(len(x), bool)
+        for k, i in enumerate(idx):
+            if i < len(y) and abs(y[i] - x[k]) <= dt:
+                near[k] = True
+            elif i > 0 and abs(y[i - 1] - x[k]) <= dt:
+                near[k] = True
+        return near.mean()
+
+    Ta, Tb = tiled(a), tiled(b)
+    Pa, Pb = prop(a, b), prop(b, a)
+    t1 = (Pa - Tb) / (1 - Pa * Tb) if (1 - Pa * Tb) != 0 else np.nan
+    t2 = (Pb - Ta) / (1 - Pb * Ta) if (1 - Pb * Ta) != 0 else np.nan
+    return 0.5 * (t1 + t2)
+
+
+def well_sttc(trains, dt, T, rng, n_shuffle=N_SHUFFLE, max_pairs=MAX_PAIRS):
+    """Mean pairwise STTC, and the circular-shift null."""
+    keys = [k for k, v in trains.items() if len(v) > 0]
+    if len(keys) < MIN_CELLS_FOR_SYNC:
+        return np.nan, np.nan, np.nan, 0
+    pairs = list(itertools.combinations(keys, 2))
+    if len(pairs) > max_pairs:
+        pairs = [pairs[i] for i in rng.choice(len(pairs), max_pairs, replace=False)]
+    obs = np.nanmean([sttc(trains[i], trains[j], dt, T) for i, j in pairs])
+    null = []
+    for _ in range(max(1, n_shuffle // 10)):
+        sh = {k: np.sort((trains[k] + rng.uniform(0, T)) % T) for k in keys}
+        null.append(np.nanmean([sttc(sh[i], sh[j], dt, T) for i, j in pairs]))
+    null = np.asarray(null, float)
+    z = ((obs - null.mean()) / null.std(ddof=1)) if null.std(ddof=1) > 0 else np.nan
+    return obs, float(null.mean()), float(z), len(pairs)
+
+
+def coactivity(trains, T, bin_s, n_watched):
+    """Largest fraction of watched cells with an event in one bin, and the
+    fraction of ALL events falling in that bin."""
+    if not trains or n_watched == 0:
+        return np.nan, np.nan, np.nan
+    edges = np.arange(0, T + bin_s, bin_s)
+    per_bin_cells = np.zeros(len(edges) - 1)
+    per_bin_events = np.zeros(len(edges) - 1)
+    for v in trains.values():
+        if len(v) == 0:
+            continue
+        h = np.histogram(v, bins=edges)[0]
+        per_bin_cells += (h > 0)
+        per_bin_events += h
+    k = int(np.argmax(per_bin_cells))
+    tot = per_bin_events.sum()
+    return (per_bin_cells[k] / n_watched,
+            per_bin_events[k] / tot if tot else np.nan,
+            float(edges[k]))
+
+
+def isi_stats(t):
+    d = np.diff(np.sort(t))
+    if len(d) == 0:
+        return dict(median_isi=np.nan, cv_isi=np.nan, cv2_isi=np.nan,
+                    n_bursts=np.nan, frac_events_in_bursts=np.nan,
+                    events_per_burst=np.nan)
+    cv = d.std(ddof=1) / d.mean() if len(d) > 1 and d.mean() > 0 else np.nan
+    cv2 = (np.mean(2 * np.abs(np.diff(d)) / (d[1:] + d[:-1]))
+           if len(d) > 1 else np.nan)
+    inb = d < BURST_ISI_S
+    nb = int(np.sum(np.diff(np.concatenate(([0], inb.astype(int)))) == 1))
+    n_in = int(inb.sum() + nb) if nb else 0
+    return dict(median_isi=float(np.median(d)), cv_isi=cv, cv2_isi=cv2,
+                n_bursts=nb, frac_events_in_bursts=n_in / (len(d) + 1),
+                events_per_burst=(n_in / nb) if nb else np.nan)
+
+
+def expand(paths):
+    out = []
+    for p in paths:
+        out += sorted(glob.glob(p))
+    return out
+
+
+def main():
+    rng = np.random.default_rng(SEED)
+    out = Path(OUT_DIR); out.mkdir(parents=True, exist_ok=True)
+    pk_files, ob_files = expand(PEAK_FILES), expand(OBJECT_FILES)
+    if not pk_files:
+        sys.exit("no per_peak.csv found - check PEAK_FILES")
+    watched = {}
+    for f in ob_files:
+        d = pd.read_csv(f, low_memory=False)
+        for (sh, r, c), g in d.groupby(["sheet", "Row", "Column"]):
+            watched[(sh, r, c)] = len(g)
+    print("%d per_peak file(s), %d per_object file(s), %d wells watched\n"
+          % (len(pk_files), len(ob_files), len(watched)))
+
+    cell_rows, well_rows = [], []
+    for f in pk_files:
+        d = pd.read_csv(f, low_memory=False)
+        if "peak_centers_seconds" not in d.columns:
+            print("  !! no peak_centers_seconds in %s" % os.path.basename(f)); continue
+        sheet = d["sheet"].iloc[0]
+        T = float(d["n_frames_analysed"].iloc[0]) / FPS
+        print("%-34s %5d events, %4d cells, %2d wells, T=%.1f s"
+              % (sheet, len(d), d.groupby(["Row", "Column", "Object ID"]).ngroups,
+                 d.groupby(["Row", "Column"]).ngroups, T))
+        meta = {k: d[k].iloc[0] for k in ("differentiation", "plate", "epoch",
+                                          "identity", "plate_format")
+                if k in d.columns}
+        for (r, c), g in d.groupby(["Row", "Column"]):
+            trains = {int(o): np.sort(x["peak_centers_seconds"].to_numpy(float))
+                      for o, x in g.groupby("Object ID")}
+            ct = str(g["Cell Type"].iloc[0]).strip()
+            cmp_ = str(g["Compound"].iloc[0]).strip()
+            for o, t in trains.items():
+                if len(t) < MIN_EVENTS_PER_CELL:
+                    continue
+                cell_rows.append(dict(sheet=sheet, **meta, well="%s%d" % (chr(64 + r), c),
+                                      Row=r, Column=c, object_id=o, cell_type=ct,
+                                      compound=cmp_, n_events=len(t), **isi_stats(t)))
+            nw = watched.get((sheet, r, c), len(trains))
+            row = dict(sheet=sheet, **meta, well="%s%d" % (chr(64 + r), c),
+                       Row=r, Column=c, cell_type=ct, compound=cmp_,
+                       n_cells_watched=nw, n_cells_active=len(trains),
+                       n_events=int(sum(len(v) for v in trains.values())))
+            cf, ef, bt = coactivity(trains, T, COACT_BIN_S, nw)
+            row.update(coact_frac_cells=cf, coact_frac_events=ef, coact_bin_start_s=bt)
+            for dt in STTC_DT_SENSITIVITY:
+                o_, n_, z_, npair = well_sttc(trains, dt, T, rng)
+                tag = "%g" % dt
+                row["sttc_dt%s" % tag] = o_
+                row["sttc_null_dt%s" % tag] = n_
+                row["sttc_above_chance_dt%s" % tag] = (o_ - n_ if np.isfinite(o_)
+                                                       and np.isfinite(n_) else np.nan)
+                row["sttc_z_dt%s" % tag] = z_
+                row["n_pairs_dt%s" % tag] = npair
+            well_rows.append(row)
+
+    cells = pd.DataFrame(cell_rows); wells = pd.DataFrame(well_rows)
+    cells.to_csv(out / "SPIKE_cell_level.csv", index=False)
+    wells.to_csv(out / "SPIKE_well_level.csv", index=False)
+    print("\nwrote SPIKE_cell_level.csv (%d cells) and SPIKE_well_level.csv (%d wells)"
+          % (len(cells), len(wells)))
+
+    if len(cells):
+        print("\nISI, per cell, median across cells")
+        print(cells.groupby([c for c in ("epoch", "identity", "cell_type")
+                             if c in cells.columns])
+              .agg(cells=("n_events", "size"), median_isi=("median_isi", "median"),
+                   cv_isi=("cv_isi", "median"), cv2_isi=("cv2_isi", "median"),
+                   events_per_burst=("events_per_burst", "median"))
+              .round(3).to_string())
+    if len(wells):
+        k = "sttc_above_chance_dt%g" % STTC_DT
+        print("\nSYNCHRONY, per well (dt = %g s)" % STTC_DT)
+        print(wells.groupby([c for c in ("epoch", "identity", "cell_type")
+                             if c in wells.columns])
+              .agg(wells=("well", "size"), cells=("n_cells_active", "median"),
+                   sttc=("sttc_dt%g" % STTC_DT, "median"),
+                   null=("sttc_null_dt%g" % STTC_DT, "median"),
+                   above_chance=(k, "median"),
+                   z=("sttc_z_dt%g" % STTC_DT, "median"),
+                   coact_cells=("coact_frac_cells", "median"),
+                   coact_events=("coact_frac_events", "median"))
+              .round(3).to_string())
+        print("\nsttc_above_chance is observed minus the circular-shift null.")
+        print("coact_frac_cells is the largest fraction of WATCHED cells with an")
+        print("event in one %g s bin; coact_frac_events is the share of all the"
+              % COACT_BIN_S)
+        print("well's events inside that same bin. Both near 1 means the well")
+        print("fires as one network event rather than as independent cells.")
+
+
+if __name__ == "__main__":
+    main()
