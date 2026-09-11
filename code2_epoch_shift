@@ -1,0 +1,320 @@
+
+epoch_shift_and_export.py
+Measure each epoch's shift from baseline, then write the aligned TH masks into
+one folder per Fluo-4 measurement UUID, each carrying its own shift.
+WHAT IT DOES, IN ONE RUN
+
+  STAGE 1  Scans EPOCH_TIFFS, parses <plate> <well> <epoch> out of the file
+           names, and cross-correlates every NBI and SNX image against its own
+           baseline. Reports the shift per well, then the per-plate mean and
+           the scatter about it.
+
+  STAGE 2  Reads the epoch UUID sheet, and for every plate writes the aligned
+           mask into one folder per epoch, named by that epoch's Fluo-4 UUID,
+           with the epoch shift applied.
+
+WHY THIS IS NEEDED
+  align_v2 registered the TH mask against the BASELINE Fluo-4. Baseline, NBI
+  and SNX are three separate measurements and the plate moves between them.
+  Measured on KR25.14 well B6: P1 baseline->NBI 3.6 px, P2 baseline->NBI 16.3 px.
+  P2's exceeds one soma (~14 px), so there the baseline mask sits on the WRONG
+  CELL. The shift is therefore per-plate, not a constant.
+
+  Within a plate it is near-uniform - KR25.14 P2, four wells, NBI->SNX:
+  (+5,+3) (+2,+1) (+7,0) (+2,0); worst well 3.2 px from the mean. So one shift
+  per plate per epoch is enough, which is why four wells suffice.
+
+WHY NOT DILATE THE REGION INSTEAD
+  Soma radius ~7 px, so growing by d px multiplies area by ((7+d)/7)^2: +5 px is
+  2.9x, +10 px is 5.7x. The added area is background and neurite and carries no
+  transient, so amplitude falls in proportion. The GBA finding is a 3.29x
+  elevation in calcium LOAD - an amplitude measure - so dilation would dilute
+  the very quantity being compared.
+
+SANITY CHECKS BUILT IN
+  - peak/rival per well; a shift is only trusted above TRUST_RATIO
+  - scatter about the plate mean, so a plate needing per-well correction is
+    flagged rather than averaged over
+  - closure: (base->SNX) - (base->NBI) should equal the direct NBI->SNX
+  - object loss off the field edge after shifting
+===============================================================================
+"""
+
+# ============================== USER CONFIG ==============================
+D = "/content/drive/MyDrive/Results/Phenix/FLUO4_ALIGNMENT"
+
+EPOCH_TIFFS = f"{D}/RAW_ICC_FLUO4_TIMESERIES/EPOCH_TIFFS"
+UUID_XLSX   = f"{EPOCH_TIFFS}/PLATE_UUID_REGISTRY.xlsx"
+UUID_SHEET  = "epoch_uuids"        # sheet holding plate / epoch / uuid
+
+SRC_ROOT = f"{D}/ALIGN_V4"   # align_v2 or align_thneg OUTPUT_ROOT
+WHICH    = "THPOS"                    # "THPOS" | "THNEG" | "REP"
+OUT_ROOT = f"{D}/HARMONY_IMPORT"
+
+MEASURE_ONLY = True   # True  = stage 1 only: print the shifts, write nothing.
+                      #         RUN THIS FIRST and read the scatter column.
+                      # False = also write the shifted masks.
+
+TRUST_RATIO  = 2.5    # peak/rival below this and the shift is not believed
+SCATTER_WARN = 5.0    # px; above this a plate needs per-well correction
+MIN_KEEP     = 0.90   # warn if a shift pushes >10% of objects off the edge
+PIXEL_UM     = 0.975
+MAX_SHIFT    = 200
+# =========================================================================
+
+import re, sys
+from pathlib import Path
+import numpy as np
+
+EPOCH_RE = re.compile(r"(?<![A-Za-z])(baseline|base|nbi|snx)(?![A-Za-z])", re.I)
+WELL_RE  = re.compile(r"(?<![A-Za-z0-9])([A-P])(\d{1,2})(?![0-9])")
+CANON    = {"base": "baseline", "baseline": "baseline", "nbi": "NBI", "snx": "SNX"}
+
+
+def parse_name(stem):
+    """<plate> <well> <epoch> from any of the naming styles in the folder."""
+    m = EPOCH_RE.search(stem)
+    if not m:
+        return None
+    epoch = CANON[m.group(1).lower()]
+    rest = (stem[:m.start()] + " " + stem[m.end():])
+    wells = WELL_RE.findall(rest)
+    if not wells:
+        return None
+    # the well is the LAST letter-number token; earlier ones are plate numbers
+    L, N = wells[-1]
+    well = f"{L.upper()}{int(N)}"
+    plate = rest[:rest.upper().rfind(f"{L.upper()}{N}")]
+    plate = re.sub(r"[_\s]+$", "", plate).strip("_ ").upper()
+    plate = re.sub(r"[_\s]+", "", plate)
+    return plate, well, epoch
+
+
+def read_img(p):
+    try:
+        import tifffile as tiff
+        a = np.asarray(tiff.imread(str(p)))
+    except Exception:
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(str(p)) as im:
+            im.seek(0); a = np.array(im)
+    a = np.asarray(a).astype(np.float64)
+    if a.ndim == 3:                      # RGBA display export: green = Fluo-4
+        a = a[..., 1] if a.shape[-1] >= 3 else a[..., 0]
+    while a.ndim > 2:
+        a = a[0]
+    return a
+
+
+def measure(A, B, maxs=MAX_SHIFT, ex=15):
+    """(dx, dy) to apply to a mask aligned on A so it lands correctly on B."""
+    A = A - A.mean(); B = B - B.mean()
+    H, W = A.shape
+    C = np.fft.irfft2(np.fft.rfft2(A) * np.conj(np.fft.rfft2(B)), s=(H, W))
+    ys, xs = np.mgrid[0:H, 0:W]
+    DY = np.where(ys > H // 2, ys - H, ys)
+    DX = np.where(xs > W // 2, xs - W, xs)
+    win = (np.abs(DY) <= maxs) & (np.abs(DX) <= maxs)
+    iy, ix = np.unravel_index(np.argmax(np.where(win, C, -np.inf)), C.shape)
+    dx, dy = int(DX[iy, ix]), int(DY[iy, ix])
+    r = np.hypot(DY - dy, DX - dx)
+    riv = float(np.where(win & (r > ex), C, -np.inf).max())
+    return dx, dy, (float(C[iy, ix]) / riv if riv > 0 else np.inf)
+
+
+def shift_labels(lab, dx, dy):
+    """Zero-fill translation. dest(x,y) = src(x-dx, y-dy). No cv2."""
+    if dx == 0 and dy == 0:
+        return lab
+    H, W = lab.shape
+    out = np.zeros_like(lab)
+    y0, y1 = max(0, dy), min(H, H + dy)
+    x0, x1 = max(0, dx), min(W, W + dx)
+    if y1 > y0 and x1 > x0:
+        out[y0:y1, x0:x1] = lab[y0 - dy:y1 - dy, x0 - dx:x1 - dx]
+    return out
+
+
+# The epoch tiffs say "KR25.12DCAS9_P2" while align_v2's output folder is
+# "KR25.12dC_P2". Collapse both to one key so they match.
+def key(s):
+    k = re.sub(r"[^A-Z0-9]", "", str(s).upper())
+    k = k.replace("DCAS9", "DC")
+    return k
+
+
+# ------------------------------- stage 1 ---------------------------------
+def stage1():
+    root = Path(EPOCH_TIFFS)
+    if not root.is_dir():
+        sys.exit(f"EPOCH_TIFFS not found:\n  {EPOCH_TIFFS}")
+    idx, bad = {}, []
+    for p in sorted(root.glob("*.tif*")):
+        r = parse_name(p.stem)
+        if r is None:
+            bad.append(p.name); continue
+        plate, well, epoch = r
+        idx.setdefault(plate, {}).setdefault(well, {})[epoch] = p
+    print(f"{sum(len(w) for w in idx.values())} well(s) across {len(idx)} plate(s)")
+    if bad:
+        print(f"  could not parse: {bad}")
+    print()
+
+    shifts = {}
+    for plate in sorted(idx):
+        print(f"=== {plate}")
+        per = {"NBI": [], "SNX": []}
+        for well in sorted(idx[plate]):
+            e = idx[plate][well]
+            if "baseline" not in e:
+                print(f"  {well}: no baseline, skipped"); continue
+            A = read_img(e["baseline"])
+            got = {}
+            for ep in ("NBI", "SNX"):
+                if ep not in e:
+                    continue
+                dx, dy, pr = measure(A, read_img(e[ep]))
+                got[ep] = (dx, dy, pr)
+                ok = pr >= TRUST_RATIO
+                if ok:
+                    per[ep].append((dx, dy))
+                print(f"  {well:<4} baseline -> {ep:<4} ({dx:+4d},{dy:+4d}) = "
+                      f"{np.hypot(dx,dy):5.1f} px = {np.hypot(dx,dy)*PIXEL_UM:5.1f} um"
+                      f"   pk/riv {pr:5.2f}{'' if ok else '   NOT TRUSTED'}")
+            if "NBI" in got and "SNX" in got:          # closure check
+                pn, ps = got["NBI"], got["SNX"]
+                dx, dy, _ = measure(read_img(e["NBI"]), read_img(e["SNX"]))
+                pred = (ps[0] - pn[0], ps[1] - pn[1])
+                flag = "" if (abs(pred[0]-dx) <= 2 and abs(pred[1]-dy) <= 2) \
+                       else "   !! CLOSURE FAILS - treat this well with suspicion"
+                print(f"       closure: predicted NBI->SNX ({pred[0]:+d},{pred[1]:+d}) "
+                      f"vs measured ({dx:+d},{dy:+d}){flag}")
+        out = {"baseline": (0, 0)}
+        for ep in ("NBI", "SNX"):
+            v = per[ep]
+            if not v:
+                print(f"  {ep}: no trusted wells - NOT WRITTEN"); continue
+            a = np.array(v, float)
+            mx, my = a[:, 0].mean(), a[:, 1].mean()
+            sc = np.hypot(a[:, 0] - mx, a[:, 1] - my)
+            warn = ("   !! scatter above %.0f px - this plate needs a PER-WELL "
+                    "shift, not one number" % SCATTER_WARN) if sc.max() > SCATTER_WARN else ""
+            print(f"  -> {ep} plate shift ({mx:+.0f},{my:+.0f}) from {len(v)} well(s); "
+                  f"worst well {sc.max():.1f} px off the mean{warn}")
+            out[ep] = (int(round(mx)), int(round(my)))
+        shifts[plate] = out
+        print()
+    print("=" * 74)
+    print("EPOCH_SHIFT, ready to paste or leave for stage 2 to use")
+    print("=" * 74)
+    for p, d in shifts.items():
+        print(f'    "{p}": ' + "{" +
+              ", ".join(f'"{k}": ({v[0]}, {v[1]})' for k, v in d.items()) + "},")
+    return shifts
+
+
+# ------------------------------- stage 2 ---------------------------------
+def load_uuids():
+    import pandas as pd
+    df = pd.read_excel(UUID_XLSX, sheet_name=UUID_SHEET)
+    df.columns = [str(c).strip() for c in df.columns]
+    cols = {c.lower(): c for c in df.columns}
+    pc = next((cols[c] for c in cols if "plate" in c), df.columns[0])
+    ec = next((cols[c] for c in cols if "epoch" in c or "condition" in c), None)
+    uc = next((cols[c] for c in cols if "uuid" in c), None)
+    out = {}
+    if ec and uc:                                        # long format
+        for _, r in df.iterrows():
+            p, e, u = key(r[pc]), str(r[ec]).strip(), str(r[uc]).strip()
+            if not u or u.lower() == "nan":
+                continue
+            out.setdefault(p, {})[CANON.get(e.lower(), e)] = u
+    else:                                                # wide format
+        for _, r in df.iterrows():
+            p = key(r[pc])
+            for c in df.columns[1:]:
+                m = EPOCH_RE.search(str(c))
+                u = str(r[c]).strip()
+                if m and u and u.lower() != "nan":
+                    out.setdefault(p, {})[CANON[m.group(1).lower()]] = u
+    print(f"read {sum(len(v) for v in out.values())} uuid(s) for {len(out)} plate(s) "
+          f"from sheet '{UUID_SHEET}'")
+    return out
+
+
+def stage2(shifts, uuids):
+    import tifffile as tiff
+    src = Path(SRC_ROOT)
+    plates = [d for d in sorted(src.iterdir())
+              if d.is_dir() and (d / "for_harmony").is_dir()]
+    if not plates:
+        sys.exit(f"No <plate>/for_harmony under {SRC_ROOT}")
+    # The tiffs may name a plate "KR25.22" where align_v2's folder is
+    # "KR25.22P1". Match exactly first, then allow one to be a prefix of the
+    # other - but ONLY when that is unambiguous, so KR25.15P1 can never be
+    # silently paired with KR25.15P5's shift.
+    sh = {key(k): v for k, v in shifts.items()}
+
+    def lookup(table, k):
+        if k in table:
+            return table[k]
+        cand = [v for kk, v in table.items()
+                if kk.startswith(k) or k.startswith(kk)]
+        return cand[0] if len(cand) == 1 else None
+    total = 0
+    for p in plates:
+        k = key(p.name)
+        masks = {}
+        for d in sorted((p / "for_harmony").iterdir()):
+            if d.is_dir():
+                h = sorted(d.glob("*/*/*.tif*")) or sorted(d.glob("*.tif*"))
+                if h:
+                    masks[d.name] = h[0]
+        if not masks:
+            continue
+        eps = lookup(sh, k)
+        uu = lookup(uuids, k)
+        if not eps or not uu:
+            print(f"  {p.name}: {len(masks)} wells   SKIPPED - "
+                  f"{'no measured shift' if not eps else 'no uuid in the sheet'}")
+            continue
+        print(f"  {p.name}: {len(masks)} wells")
+        for ep, (dx, dy) in eps.items():
+            uid = uu.get(ep)
+            if not uid:
+                print(f"      {ep:<9} no uuid in the sheet - skipped"); continue
+            dst_root = Path(OUT_ROOT) / WHICH / f"{uid}__{ep}__{WHICH}"
+            n = lost = 0; worst = 1.0
+            for wellname, srcf in masks.items():
+                dst = dst_root / wellname / "MAP" / "DAPI" / srcf.name
+                if dst.exists():
+                    continue
+                lab = np.asarray(tiff.imread(str(srcf)))
+                while lab.ndim > 2:
+                    lab = lab[0]
+                before = len(np.unique(lab[lab > 0]))
+                o = shift_labels(lab, dx, dy)
+                after = len(np.unique(o[o > 0]))
+                f = after / before if before else 1.0
+                worst = min(worst, f); lost += f < MIN_KEEP
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                tiff.imwrite(str(dst), o.astype(np.uint16), compression=None)
+                n += 1
+            total += n
+            w = (f"   !! {lost} well(s) lost >10% of objects off the edge "
+                 f"(worst kept {worst:.0%})") if lost else ""
+            print(f"      {ep:<9} {n:>3} file(s)  shift ({dx:+d},{dy:+d}) -> "
+                  f"{uid[:8]}...__{ep}__{WHICH}{w}")
+    print(f"\nwrote {total} file(s) -> {Path(OUT_ROOT)/WHICH}")
+
+
+if __name__ == "__main__":
+    s = stage1()
+    if MEASURE_ONLY:
+        print("\nMEASURE_ONLY is True. Read the scatter lines above; if every")
+        print("plate is under the warning, set MEASURE_ONLY = False and re-run")
+        print("to write the shifted masks.")
+    else:
+        print("\n" + "=" * 74); print("STAGE 2: writing shifted masks"); print("=" * 74)
+        stage2(s, load_uuids())
