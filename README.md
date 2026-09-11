@@ -1,7 +1,9 @@
 
 align_v2.py
+
 Per-well TH mask -> Fluo-4 alignment, scored, with an auditable pass/fail per
 well and the region growth moved OUT of Harmony and INTO the mask.
+
 WHY THIS REPLACES run_batch_map2_anchor
 
   1  MAP2 was the wrong anchor. Its dominant structure is the neurite mesh;
@@ -27,10 +29,10 @@ WHY THIS REPLACES run_batch_map2_anchor
   5  Every well gets three QC numbers and a verdict, so the wells you cannot
      rescue are DECLARED rather than silently averaged in.
 
-WHAT YOU NEED THAT YOU MAY NOT HAVE YET
+WHAT YOU NEED 
   One Fluo-4 intensity image per well (field 1, timepoint 1, or a projection).
   In Harmony this is a single batch image export per measurement, not 36 manual
-  ones. Everything else - the TH label masks - you already have.
+  ones. 
 
 SETTING THE HARMONY RESIZE TO 0%
   Set CALIBRATE_DILATION = True and run once. The script reports, per plate,
@@ -42,5 +44,4 @@ SETTING THE HARMONY RESIZE TO 0%
   -100% in a building block.
 
 
-if __name__ == "__main__":
-    main()
+
