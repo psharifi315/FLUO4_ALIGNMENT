@@ -43,5 +43,8 @@ SETTING THE HARMONY RESIZE TO 0%
   growth is an explicit, documented number in your methods instead of a hidden
   -100% in a building block.
 
+  <img width="517" height="523" alt="realingment_example" src="https://github.com/user-attachments/assets/43627e48-2d58-4526-b9b4-041abc0e7aff" />
+
+
 
 
