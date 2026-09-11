@@ -1,9 +1,7 @@
-"""
-===============================================================================
+
 align_v2.py
 Per-well TH mask -> Fluo-4 alignment, scored, with an auditable pass/fail per
 well and the region growth moved OUT of Harmony and INTO the mask.
-===============================================================================
 WHY THIS REPLACES run_batch_map2_anchor
 
   1  MAP2 was the wrong anchor. Its dominant structure is the neurite mesh;
